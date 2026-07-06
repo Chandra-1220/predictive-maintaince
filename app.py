@@ -117,18 +117,56 @@ def train_models(df: pd.DataFrame):
         available_features = [c for c in data.select_dtypes(include=np.number).columns
                                if c != TARGET_COL]
 
+    # Drop rows with missing target or missing features — a model can't be
+    # fit on them, and they'd otherwise break XGBoost's label validation.
+    data = data.dropna(subset=[TARGET_COL] + available_features).reset_index(drop=True)
+
+    # Always label-encode the target, regardless of its original dtype
+    # (text like "Yes"/"No", numeric like 0/1, 1/2, booleans, floats with
+    # NaNs, etc.) so downstream models always see contiguous ints [0..k-1].
     le = LabelEncoder()
-    if data[TARGET_COL].dtype == object:
-        data[TARGET_COL] = le.fit_transform(data[TARGET_COL])
-        classes_ = le.classes_
+    data[TARGET_COL] = data[TARGET_COL].astype(str)
+    data[TARGET_COL] = le.fit_transform(data[TARGET_COL])
+    classes_ = le.classes_
+
+    if data[TARGET_COL].nunique() < 2:
+        raise ValueError(
+            "The 'Failure' column only contains a single class after cleaning. "
+            "At least two classes (failure / no failure) are required to train a model."
+        )
+
+    # Figure out which encoded integer represents "failure" so that
+    # predict_proba(...)[:, 1] reliably means "probability of failure"
+    # regardless of how the original labels were spelled (Yes/No, 1/0,
+    # Failure/Normal, True/False, ...).
+    class_strings = [str(c).strip().lower() for c in classes_]
+    # Only trust "1"/"0" as failure/no-failure when the target is a clean
+    # standard binary 0/1 encoding — otherwise a numeric scheme like 1/2
+    # (where "1" happens to mean *no* failure) would be misread.
+    if set(class_strings) == {"0", "1"}:
+        failure_tokens = {"1"}
     else:
-        classes_ = np.array(["No", "Yes"])
+        failure_tokens = {"yes", "true", "fail", "failure", "y", "positive"}
+    failure_idx = next((i for i, c in enumerate(class_strings) if c in failure_tokens), None)
+    if failure_idx is None:
+        # Fall back: assume failures are the rarer class (typical for
+        # predictive maintenance, where breakdowns are uncommon events).
+        counts = data[TARGET_COL].value_counts()
+        failure_idx = int(counts.idxmin())
+
+    # If the class that already means "failure" isn't already index 1,
+    # swap the encoding so it is — this keeps every [:, 1] probability
+    # lookup elsewhere in the app correct. Only safe/needed for the
+    # standard binary failure/no-failure case.
+    if len(classes_) == 2 and failure_idx != 1:
+        data[TARGET_COL] = 1 - data[TARGET_COL]
+        classes_ = classes_[::-1]
 
     X = data[available_features]
     y = data[TARGET_COL]
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y if y.nunique() > 1 else None
+        X, y, test_size=0.20, random_state=42, stratify=y
     )
 
     models = {
